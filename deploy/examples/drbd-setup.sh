@@ -63,7 +63,7 @@ OUTPUT_CM_NAME="${OUTPUT_CM_NAME:-drbd-configure}"               # Name for the 
 # OpenShift namespace for DRBD summary ConfigMap, CephCluster, and floating mon (default OpenShift ODF).
 ODF_NAMESPACE="${ODF_NAMESPACE:-openshift-storage}"
 
-# install | upgrade (set in parse_args; default install)
+# install | upgrade | uninstall (set in parse_args; default install)
 MODE=""
 
 # Approximate wait ceilings in this script: KMM operator ~5m (60×5s); DRBD modules ~10m (60×10s);
@@ -85,13 +85,14 @@ NODE_0_IP=""
 NODE_1_IP=""
 
 PREVIOUS_DRBD_VERSION="" # prior DRBD_VERSION from drbd-configure ConfigMap
+PREVIOUS_DRBD_IMAGE=""   # prior DRBD_UTILS_IMAGE from drbd-configure ConfigMap
 
 #--- Functions ---#
 
 usage() {
     cat <<USAGE
 Usage examples:
-  $0 -l | $0 -d <path> | $0 -d0 <path> -d1 <path> | $0 upgrade | $0 help
+  $0 -l | $0 -d <path> | $0 -d0 <path> -d1 <path> | $0 upgrade | $0 uninstall | $0 help
 
 Default Mode (install) —
 
@@ -121,6 +122,16 @@ Upgrade Mode —
 What upgrade does: scale floating Ceph mon, remove autostart DaemonSet, drbdadm down,
 delete and re-apply KMM Module + Dockerfile, wait for new kmods, drbdadm up, sync if needed,
 recreate autostart DaemonSet, scale mon back.
+
+Uninstall Mode —
+
+(no disk flags — state is read from ConfigMap ${ODF_NAMESPACE}/${OUTPUT_CM_NAME})
+
+Prerequisite: delete the StorageCluster before running uninstall.
+
+What uninstall does: remove autostart DaemonSet, drbdadm down, delete KMM Module + Dockerfile,
+wipe DRBD metadata and zero backing disks, remove host DRBD config files,
+delete the setup ConfigMap.
 
 General:
   -h, --help   Show this text.
@@ -224,6 +235,17 @@ parse_args() {
         else
             die "upgrade accepts no arguments (got '$1'). See: $0 upgrade -h"
         fi
+    elif [[ "$1" == "uninstall" ]]; then
+        MODE="uninstall"
+        shift
+        if [[ $# -eq 0 ]]; then
+            :
+        elif [[ "$1" == "-h" || "$1" == "--help" ]]; then
+            usage
+            exit 0
+        else
+            die "uninstall accepts no arguments (got '$1'). See: $0 uninstall -h"
+        fi
     elif [[ "$1" == "install" ]]; then
         MODE="install"
         shift
@@ -234,15 +256,15 @@ parse_args() {
     fi
 
     if [[ "$LIST_DEVICES_ONLY" -eq 1 ]]; then
-        if [[ "$MODE" == "upgrade" ]]; then
-            die "upgrade does not support -l (use: $0 -l for device discovery)"
+        if [[ "$MODE" == "upgrade" || "$MODE" == "uninstall" ]]; then
+            die "${MODE} does not support -l (use: $0 -l for device discovery)"
         fi
         return 0
     fi
 
-    if [[ "$MODE" == "upgrade" ]]; then
+    if [[ "$MODE" == "upgrade" || "$MODE" == "uninstall" ]]; then
         if [[ -n "$BACKING_PATH" || -n "$BACKING_PATH_NODE0" || -n "$BACKING_PATH_NODE1" ]]; then
-            die "upgrade does not use -d/-d0/-d1; use ConfigMap ${ODF_NAMESPACE}/${OUTPUT_CM_NAME} (from default setup). Run: $0 upgrade"
+            die "${MODE} does not use -d/-d0/-d1; use ConfigMap ${ODF_NAMESPACE}/${OUTPUT_CM_NAME} (from default setup). Run: $0 ${MODE}"
         fi
         return 0
     fi
@@ -354,6 +376,24 @@ validate_and_load-drbd_configure_cm() {
 
     PREVIOUS_DRBD_VERSION=$(oc get configmap "${OUTPUT_CM_NAME}" -n "${ODF_NAMESPACE}" \
         -o jsonpath='{.data.DRBD_VERSION}' 2>/dev/null | tr -d '\r\n' || true)
+    PREVIOUS_DRBD_IMAGE=$(oc get configmap "${OUTPUT_CM_NAME}" -n "${ODF_NAMESPACE}" \
+        -o jsonpath='{.data.DRBD_UTILS_IMAGE}' 2>/dev/null | tr -d '\r\n' || true)
+    if [[ -n "$PREVIOUS_DRBD_IMAGE" ]]; then
+        DRBD_IMAGE="$PREVIOUS_DRBD_IMAGE"
+    fi
+}
+
+print_uninstall_plan() {
+    echo ""
+    msg "Uninstall plan"
+    local _lw=18
+    printf '  %-*s %s\n' "$_lw" "Mode:" "uninstall (remove DRBD; zero backing disks)"
+    printf '  %-*s %s\n' "$_lw" "Nodes:" "$NODE_0 ($NODE_0_IP), $NODE_1 ($NODE_1_IP)"
+    printf '  %-*s %s: %s\n' "$_lw" "DRBD Disks by id:" "$NODE_0" "$DISK_RESOLVED_NODE0"
+    printf '  %-*s %s: %s\n' "$_lw" "" "$NODE_1" "$DISK_RESOLVED_NODE1"
+    printf '  %-*s %s\n' "$_lw" "DRBD_VERSION:" "$PREVIOUS_DRBD_VERSION"
+    printf '  %-*s %s\n' "$_lw" "DRBD_IMAGE:" "${PREVIOUS_DRBD_IMAGE:-$DRBD_IMAGE}"
+    echo ""
 }
 
 print_config() {
@@ -1139,6 +1179,17 @@ floating_mon_deployment_name() {
     echo "rook-ceph-mon-${name}"
 }
 
+# Fail fast if StorageCluster still exists (uninstall prerequisite).
+ensure_uninstall_prerequisites() {
+    msg "Checking StorageCluster is absent before uninstall..."
+
+    if oc get storagecluster -n "${ODF_NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
+        die "StorageCluster still exists in ${ODF_NAMESPACE}. Delete it before running uninstall"
+    fi
+
+    msg "No StorageCluster found; proceeding with uninstall."
+}
+
 # Scale the floating mon deployment to the given number of replicas.
 # Before scale to 0: set ceph.rook.io/do-not-reconcile=true on the Deployment so Rook does not fight the scale.
 # Before scale up (replicas > 0): remove that label, then scale.
@@ -1187,6 +1238,53 @@ drbd_demote_and_down_all() {
         msg "Node ${node}: drbdadm down ${DRBD_RESOURCE}..."
         drbdctl "$node" down "${DRBD_RESOURCE}" || true
     done
+}
+
+# Wipe DRBD metadata from backing devices on both nodes (requires host config still present).
+wipe_drbd_metadata() {
+    local node
+    msg "Wiping DRBD metadata from backing devices on both nodes"
+    for node in "$NODE_0" "$NODE_1"; do
+        msg "Node ${node}: drbdadm wipe-md ${DRBD_RESOURCE}..."
+        drbdctl "$node" wipe-md "${DRBD_RESOURCE}" --force 2>/dev/null || true
+    done
+}
+
+# Zero entire backing devices on both nodes so reinstall does not see leftover DRBD/user data.
+wipe_drbd_backing_devices() {
+    local node disk
+    msg "Zeroing backing devices on both nodes"
+    for node in "$NODE_0" "$NODE_1"; do
+        if [[ "$node" == "$NODE_0" ]]; then
+            disk="$DISK_RESOLVED_NODE0"
+        else
+            disk="$DISK_RESOLVED_NODE1"
+        fi
+        msg "Node ${node}: zeroing ${disk} (may take several minutes)..."
+        if ! oc debug -q "node/$node" -- chroot /host bash -c "
+            dd if=/dev/zero of='${disk}' bs=1M count=\$(( \$(blockdev --getsize64 '${disk}') / 1048576 )) status=progress conv=fsync
+        "; then
+            die "dd zero failed on ${node} for ${disk}"
+        fi
+    done
+}
+
+# Remove host-side DRBD configuration files written during install/upgrade.
+delete_host_drbd_config() {
+    local node res_path="${DRBD_DIR_PATH}/${DRBD_RESOURCE}.res"
+    msg "Removing DRBD config files from both nodes"
+    for node in "$NODE_0" "$NODE_1"; do
+        msg "Node ${node}: removing ${DRBD_CONF_PATH} and ${res_path}..."
+        oc debug -q "node/$node" -- chroot /host bash -c "
+            rm -f '${DRBD_CONF_PATH}' '${res_path}'
+        " || true
+    done
+}
+
+# Delete the setup summary ConfigMap.
+delete_drbd_configure_configmap() {
+    msg "Deleting ConfigMap ${ODF_NAMESPACE}/${OUTPUT_CM_NAME}..."
+    oc delete configmap "${OUTPUT_CM_NAME}" -n "${ODF_NAMESPACE}" --ignore-not-found >/dev/null
 }
 
 # create the success ConfigMap to save the setup summary for further consumption.
@@ -1238,15 +1336,20 @@ print_success() {
     echo ""
     if [[ "$MODE" == "upgrade" ]]; then
         echo "  --> DRBD version upgraded from ${PREVIOUS_DRBD_VERSION} to ${DRBD_VERSION} successfully <--"
+    elif [[ "$MODE" == "uninstall" ]]; then
+        echo "  --> DRBD version ${PREVIOUS_DRBD_VERSION} uninstalled; backing devices zeroed on both nodes <--"
     else
         echo "  --> DRBD version ${DRBD_VERSION} installed successfully <--"
     fi
-    echo ""
-    echo "Check DRBD status on ${NODE_0} (repeat with ${NODE_1}):"
-    echo "  oc debug -q node/${NODE_0} -- chroot /host podman run --rm --privileged \\"
-    echo "    -v /dev:/dev -v ${DRBD_CONF_PATH}:${DRBD_CONF_PATH} -v ${DRBD_DIR_PATH}:${DRBD_DIR_PATH} \\"
-    echo "    --hostname ${NODE_0} --net host ${DRBD_IMAGE} drbdadm -c ${DRBD_CONF_PATH} status ${DRBD_RESOURCE}"
-    echo ""
+
+    if [[ "$MODE" != "uninstall" ]]; then
+        echo ""
+        echo "Check DRBD status on ${NODE_0} (repeat with ${NODE_1}):"
+        echo "  oc debug -q node/${NODE_0} -- chroot /host podman run --rm --privileged \\"
+        echo "    -v /dev:/dev -v ${DRBD_CONF_PATH}:${DRBD_CONF_PATH} -v ${DRBD_DIR_PATH}:${DRBD_DIR_PATH} \\"
+        echo "    --hostname ${NODE_0} --net host ${DRBD_IMAGE} drbdadm -c ${DRBD_CONF_PATH} status ${DRBD_RESOURCE}"
+        echo ""
+    fi
 }
 
 run_install() {
@@ -1292,6 +1395,20 @@ run_upgrade() {
     print_success # print the success message
 }
 
+run_uninstall() {
+    validate_and_load-drbd_configure_cm # validate output ConfigMap presence and load DRBD disk by-id mapping
+    print_uninstall_plan # show disks and version that will be removed
+    ensure_uninstall_prerequisites # require StorageCluster deleted before uninstall
+    delete_drbd_autostart_daemonset # delete the DRBD auto-start DaemonSet
+    drbd_demote_and_down_all # demote and down the DRBD resource on both nodes
+    delete_drbd_kmm_module_resources # delete the KMM Module and Dockerfile ConfigMap
+    # wipe_drbd_metadata # wipe DRBD metadata from backing devices
+    wipe_drbd_backing_devices # zero backing devices on both nodes
+    delete_host_drbd_config # remove host-side DRBD config files
+    delete_drbd_configure_configmap # delete the setup summary ConfigMap
+    print_success # print the success message
+}
+
 main() {
     parse_args "$@"
     check_prerequisites # check if the prerequisites are met
@@ -1304,6 +1421,8 @@ main() {
 
     if [[ "$MODE" == "upgrade" ]]; then
         run_upgrade
+    elif [[ "$MODE" == "uninstall" ]]; then
+        run_uninstall
     else
         run_install
     fi
