@@ -107,18 +107,15 @@ function generate_csv() {
     # Update the "create-external-resources.py" script value in external-cluster-script-configmap
     yq eval-all ".data.script = (load_str(\"$CEPH_EXTERNAL_SCRIPT_FILE\") | @base64)" --inplace "$EXTERNAL_CLUSTER_SCRIPT_CONFIGMAP"
 
-    # When running "make gen-csv" (this script), you may set DRBD_IMAGE and/or DRBD_VERSION in the
-    # environment to replace the defaults in deploy/examples/drbd-setup.sh in the embedded ConfigMap.
+    # When running "make gen-csv" (this script), you may set DRBD_IMAGE in the environment to replace
+    # the default in deploy/examples/drbd-setup.sh in the embedded ConfigMap.
     drbd_tmp="$(mktemp)"
-    if [[ -n "${DRBD_IMAGE:-}" || -n "${DRBD_VERSION:-}" ]]; then
+    if [[ -n "${DRBD_IMAGE:-}" ]]; then
       local _drbd_img_line_re='^DRBD_IMAGE="\$\{DRBD_IMAGE:-([^}]+)\}"(.*)$'
-      local _drbd_ver_line_re='^DRBD_VERSION="\$\{DRBD_VERSION:-([^}]+)\}"(.*)$'
       local _drbd_line
       while IFS= read -r _drbd_line || [[ -n "${_drbd_line}" ]]; do
         if [[ -n "${DRBD_IMAGE:-}" && ${_drbd_line} =~ ${_drbd_img_line_re} ]]; then
           _drbd_line="DRBD_IMAGE=\"\${DRBD_IMAGE:-${DRBD_IMAGE}}\""${BASH_REMATCH[2]}
-        elif [[ -n "${DRBD_VERSION:-}" && ${_drbd_line} =~ ${_drbd_ver_line_re} ]]; then
-          _drbd_line="DRBD_VERSION=\"\${DRBD_VERSION:-${DRBD_VERSION}}\""${BASH_REMATCH[2]}
         fi
         printf '%s\n' "${_drbd_line}"
       done <"${DRBD_SETUP_SCRIPT_FILE}" >"${drbd_tmp}"

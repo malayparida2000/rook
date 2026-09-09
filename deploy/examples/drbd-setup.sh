@@ -332,6 +332,25 @@ detect_nodes() {
     fi
 }
 
+# Read DRBD kernel source version from /drbd.version in DRBD_IMAGE (unless DRBD_VERSION is set).
+resolve_drbd_version() {
+    if [[ -n "$DRBD_VERSION" ]]; then
+        return 0
+    fi
+
+    local version
+    # Pull quietly first; podman run otherwise prints pull progress to stdout and pollutes cat output.
+    version=$(oc debug -q "node/$NODE_0" -- chroot /host bash -c "
+        podman pull -q --authfile /var/lib/kubelet/config.json '${DRBD_IMAGE}' >/dev/null 2>&1 &&
+        podman run --rm --authfile /var/lib/kubelet/config.json '${DRBD_IMAGE}' cat /drbd.version
+    " 2>/dev/null | tr -d '\r\n' || true)
+    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)+([+-][A-Za-z0-9.-]+)?$ ]]; then
+        die "could not read DRBD version from ${DRBD_IMAGE} (/drbd.version on node ${NODE_0}); set DRBD_VERSION or ensure nodes can pull the image"
+    fi
+    DRBD_VERSION="$version"
+    msg "Resolved DRBD_VERSION ${DRBD_VERSION} from ${DRBD_IMAGE}"
+}
+
 # list block devices on both nodes with lsblk
 list_devices() {
     echo "=== Block devices (node0=$NODE_0, node1=$NODE_1) ==="
@@ -1500,6 +1519,7 @@ print_success() {
 }
 
 run_install() {
+    resolve_drbd_version # read /drbd.version from DRBD_IMAGE unless DRBD_VERSION is set
     validate_and_resolve_disks # validate paths and resolve to /dev/disk/by-id
     print_config # print the configuration
     setup_kmm_operator # setup the KMM operator
@@ -1519,6 +1539,7 @@ run_install() {
 
 run_upgrade() {
     validate_and_load_drbd_configure_cm # validate output ConfigMap presence
+    resolve_drbd_version # read /drbd.version from DRBD_IMAGE unless DRBD_VERSION is set
     print_config # print the configuration
     setup_kmm_operator # setup the KMM operator
     setup_image_registry_operator # setup the image registry operator
